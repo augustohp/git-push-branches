@@ -1,0 +1,224 @@
+#!/usr/bin/env sh
+# vim: filetype=sh noexpandtab sw=4 ts=4:
+# Description: Lists branches that you want to migrate to another SCM 
+
+set -e
+if [ "$DEBUG" == "1" ]
+then
+	set -x
+else
+	set +x
+fi
+
+APP_VERSION="1.0.0"
+APP_NAME=$(basename $0) 
+APP_AUTHOR="Augusto Pascutti <augusto.hp@gmail.com>"
+
+APP_DEFAULT_SINCE="1 month ago"
+APP_DEFAULT_TO_REMOTE="mine"
+APP_DEFAULT_FROM_REMOTE="origin"
+APP_DEFAULT_DRY_RUN=0
+
+APP_TMP_REPO="/tmp/git-push-branches"
+APP_BRANCH_PREFIX="git-push-branches"
+APP_PWD=${PWD}
+
+on_exit ()
+{
+	# Cleanups that don't need to be on repository directory
+	rm -rf "${APP_TMP_REPO}" 2> /dev/null > /dev/null
+
+	pushd "${APP_PWD}" > /dev/null
+	for branch_to_remove in $(git branch 2> /dev/null | grep "${APP_BRANCH_PREFIX}" | no_leading_spaces)
+	do 
+		git branch -D "${branch_to_remove}" 2> /dev/null
+	done
+	popd > /dev/null
+}
+trap on_exit EXIT
+
+# Ends program execution printing a message to stderr
+# Usage: fail <message>
+fail ()
+{
+	echo "Error: $@" >&2
+	exit 2
+}
+
+# Usage: echo '  something' | no_leading_spaces
+no_leading_spaces ()
+{
+	sed 's/^ [ \t]*//g'
+}
+
+# Prints help message
+# Usage: gm_help
+gm_help ()
+{
+	cat <<-EOL
+	Usage: $APP_NAME [options]
+	       $APP_NAME --since="2018-01-01" --to-remote gitlab --from-remote gerrit
+
+	Sends branches from a remote to another, avoiding sending ones that are old or
+	already merged.
+
+	Options
+	
+	  -s, --since <date>        Only migrate branchs that have the last commit since
+	                            the mentioned date (default: "${APP_DEFAULT_SINCE}").
+	  -t, --to-remote <name>    Remote that will receive branches to be migrated, 
+	                            allowing other rules here descibed (default: "${APP_DEFAULT_TO_REMOTE}").
+	  -f, --from-remote <name>  Remote that will be the source of branches (default: "${APP_DEFAULT_FROM_REMOTE}").
+	  -d, --dry-run             Does nothing, only print branch names to migrate.
+	  -v, --version             Displays version of the program.
+	  -h                        Displays this help message.
+
+	Share issues/ideas with $APP_AUTHOR.
+	EOL
+}
+
+# Ensures everything is good to go in the current directory
+# Usage: gm_assert_dir_sanity <directory>
+gm_assert_dir_sanity ()
+{
+	local dir_path="${1}"
+	local not_empty_if_from_remote_exists=""
+	local not_empty_if_to_remote_exists=""
+
+	if [ ! -d "${dir_path}" ]
+	then
+		fail "Path '${dir_path}' is not a directory or does not exist."
+	fi
+	if [ ! -d "${dir_path}/.git" ]
+	then
+		fail "Directory '${dir_path}' is not a Git repository."
+	fi
+	if [ -z "$(which git)" ]
+	then
+		fail "Git command not available."
+	fi
+
+	dir_name=$(realpath "${dir_path}")
+	pushd "${dir_path}" > /dev/null
+	not_empty_if_from_remote_exists=$(git remote -v | grep "${APP_DEFAULT_FROM_REMOTE}")
+	not_empty_if_to_remote_exists=$(git remote -v | grep "${APP_DEFAULT_TO_REMOTE}")
+	if [ -z "$not_empty_if_to_remote_exists" ]
+	then
+		fail "The git remote ($APP_DEFAULT_TO_REMOTE) that is the destination of branches does not exist in this repository."
+	fi
+	if [ -z "$not_empty_if_from_remote_exists" ]
+	then
+		fail "The git remote ($APP_DEFAULT_FROM_REMOTE) that is the source of branches does not exist in this repository."
+	fi
+	popd > /dev/null
+}
+
+# Assumes it is inside a Git repository conforming conditions previously asserted
+# Usage: gm_list_branches_to_migrate
+gm_list_branches_from_origin ()
+{
+	git branch -r --no-merged | \
+		no_leading_spaces | \
+		grep -v '\->' | \
+		grep -v "${APP_DEFAULT_FROM_REMOTE}/master" | \
+		grep "${APP_DEFAULT_FROM_REMOTE}/"
+}
+
+# Receives a branch name from the pipe and prints its name if it has newer commits than we want
+# Usage: gm_list_branches_from_origin | gm_filter_old_branches
+gm_filter_old_branches ()
+{
+	while read branch_name
+	do
+		checkout_dir="$APP_TMP_REPO"
+
+		mkdir -p "${checkout_dir}" > /dev/null
+		git worktree add "${checkout_dir}" "${branch_name}" 2> /dev/null > /dev/null
+		pushd "${checkout_dir}" > /dev/null
+		how_many_commits_are_relevant=$(git log --oneline --since "${APP_DEFAULT_SINCE}" | wc -l | no_leading_spaces)
+		if [ "$how_many_commits_are_relevant" -gt 0 ]
+		then
+			echo "${branch_name}"
+		fi
+		popd > /dev/null
+		rm -rf "${checkout_dir}" > /dev/null
+		git worktree prune > /dev/null
+	done
+}
+
+gm_main ()
+{
+	local repository_dir=$(realpath ${1:-$PWD})
+	APP_PWD="${repository_dir}"
+	
+	gm_assert_dir_sanity "${repository_dir}"
+	pushd "${repository_dir}" > /dev/null
+	# Avoids having branches which are too old and don't exist on ORIGIN
+	git fetch ${APP_DEFAULT_FROM_REMOTE} --tags --prune > /dev/null
+	for branch_to_migrate in $(gm_list_branches_from_origin | gm_filter_old_branches)
+	do
+		branch_name_without_remote="${branch_to_migrate#${APP_DEFAULT_FROM_REMOTE}/}"
+		reference_branch="${APP_BRANCH_PREFIX}/${branch_name_without_remote}"
+		checkout_dir="$APP_TMP_REPO"
+
+		mkdir -p "${checkout_dir}" > /dev/null
+		# Checkout branch on another directory to avoid dealing with stashes
+		git worktree add "${checkout_dir}" "${branch_to_migrate}" 2> /dev/null > /dev/null
+		pushd "${checkout_dir}" > /dev/null
+		if [ $APP_DEFAULT_DRY_RUN -eq 1 ]
+		then
+			# Only print branch to migrate so they can be used with another tools
+			echo $branch_to_migrate
+		else
+			git push -f "${APP_DEFAULT_TO_REMOTE}" "${branch_name_without_remote}" > /dev/null
+		fi
+		popd > /dev/null
+		rm -rf "${checkout_dir}" > /dev/null
+		git worktree prune > /dev/null
+	done
+
+	if [ $APP_DEFAULT_DRY_RUN -eq 1 ]
+	then
+		git push "${APP_DEFAULT_TO_REMOTE}" --tags
+	fi
+	popd > /dev/null
+}
+
+while true
+do
+	case "$1" in
+		-h | --help) 
+			gm_help 
+			exit 0
+			;;
+		-v | --version)
+			echo "$APP_NAME $APP_VERSION"
+			exit 0
+			;;
+		-s | --since)
+			APP_DEFAULT_SINCE="$2"
+			shift 2
+			;;
+		-t | --to-remote)
+			APP_DEFAULT_TO_REMOTE="$2"
+			shift 2
+			;;
+		-f | --from-remote)
+			APP_DEFAULT_FROM_REMOTE="$2"
+			shift 2
+			;;
+		-d | --dry-run)
+			APP_DEFAULT_DRY_RUN=1
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+		*)
+			break
+			;;
+	esac
+done
+
+gm_main $@
